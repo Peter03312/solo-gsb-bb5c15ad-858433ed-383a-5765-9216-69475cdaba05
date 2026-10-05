@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 端到端调用示例：录入作品 → 销售 → 退款 → 关账 → 查看报表 → 付款结算
-#              → 作者分成版本变更 → 新版本销售/旧销售退款 → 退出作者结算
+#              → 银行退票整笔冲回 → 作者分成版本变更 → 新版本销售/旧销售退款 → 退出作者结算
 # 用法：BASE_URL=http://localhost:8000 ./examples/demo.sh
 set -euo pipefail
 
@@ -78,6 +78,35 @@ curl -s -X POST "$BASE/payments" -H 'Content-Type: application/json' -d "{
 echo "== 9. 按作者查询：分批应计/已付/负余额/可付额/付款记录 =="
 curl -s "$BASE/authors/A1/settlement" | fmt
 curl -s "$BASE/payments/PAY-2026-09-A1" | fmt
+
+echo "== 9b. 银行退票：凭全局唯一冲回编号 + 原付款编号登记整笔冲回（不支持部分冲回）=="
+echo "    冲回金额恒等于原付款；有效已付额归零、可付额恢复；原付款快照与关账报表不改写"
+curl -s -X POST "$BASE/payment-reversals" -H 'Content-Type: application/json' -d '{
+  "reversal_id": "REV-2026-10-001",
+  "payment_id": "PAY-2026-09-A1"
+}' | fmt
+
+echo "== 9c. 同冲回编号同内容重试 → 200 原冻结结果；同号异内容/换编号重复冲回 → 409 =="
+curl -s -o /dev/null -w 'replay status: %{http_code}\n' -X POST "$BASE/payment-reversals" \
+  -H 'Content-Type: application/json' -d '{
+    "reversal_id": "REV-2026-10-001", "payment_id": "PAY-2026-09-A1"
+  }'
+curl -s -o /dev/null -w 'other payment status: %{http_code} (409)\n' -X POST "$BASE/payment-reversals" \
+  -H 'Content-Type: application/json' -d '{
+    "reversal_id": "REV-2026-10-001", "payment_id": "PAY-OTHER"
+  }'
+curl -s -o /dev/null -w 'new reversal-id status: %{http_code} (409)\n' -X POST "$BASE/payment-reversals" \
+  -H 'Content-Type: application/json' -d '{
+    "reversal_id": "REV-2026-10-002", "payment_id": "PAY-2026-09-A1"
+  }'
+curl -s -o /dev/null -w 'missing payment status: %{http_code} (404)\n' -X POST "$BASE/payment-reversals" \
+  -H 'Content-Type: application/json' -d '{
+    "reversal_id": "REV-2026-10-009", "payment_id": "PAY-NOPE"
+  }'
+
+echo "== 9d. 按冲回编号查询冻结结果；结算总览分列付款总额/冲回/有效已付，并列冲回记录 =="
+curl -s "$BASE/payment-reversals/REV-2026-10-001" | fmt
+curl -s "$BASE/authors/A1/settlement" | fmt
 
 echo "== 10. 合作关系变化：提交作者分成新版本（A2 退出、A3 加入；变更编号全局唯一）=="
 curl -s -X POST "$BASE/works/BOOK-1/splits" -H 'Content-Type: application/json' -d '{

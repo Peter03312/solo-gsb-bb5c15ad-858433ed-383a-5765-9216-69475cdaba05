@@ -463,6 +463,237 @@ def test_payment_and_author_edge_cases(client):
     assert client.get("/authors/NOBODY/settlement").status_code == 404
 
 
+# ----------------------------------------------------- 银行退票整笔付款冲回
+
+
+def reverse_payment(client, reversal_id, payment_id):
+    return client.post(
+        "/payment-reversals",
+        json={"reversal_id": reversal_id, "payment_id": payment_id},
+    )
+
+
+def _setup_paid_author(client, payment_id="P1", amount=100000):
+    """建作品 → 销售 800 册（A1 应计 128160）→ 关账 → A1 付款 amount 分。"""
+    make_work(client)
+    make_sale(client, "S1", copies=800)
+    close_id = client.post("/closes", json={"request_id": "C1"}).json()["close_id"]
+    r = pay(client, payment_id, "A1", close_id, amount)
+    assert r.status_code == 201
+    return close_id
+
+
+def test_payment_reversal_happy_path_and_settlement(client):
+    close_id = _setup_paid_author(client, "P1", 100000)
+
+    r = reverse_payment(client, "RV1", "P1")
+    assert r.status_code == 201
+    body = r.json()
+    assert body["type"] == "payment_reversal"
+    assert body["reversal_id"] == "RV1" and body["payment_id"] == "P1"
+    assert body["author_id"] == "A1"
+    assert body["reversal_amount_cents"] == 100000  # 整笔冲回，金额恒等于原付款
+    snap = body["author_settlement"]
+    assert snap["latest_close_id"] == close_id and snap["accrued_cents"] == 128160
+    assert snap["paid_before_cents"] == 100000  # 付款总额（毛额）
+    assert snap["reversed_before_cents"] == 100000  # 含本次冲回
+    assert snap["effective_paid_cents"] == 0  # 有效已付额 = 付款总额 − 冲回总额
+    assert snap["payable_cents"] == 128160  # 冲回释放全部可付额
+    assert snap["negative_balance_cents"] == 0
+    # 关联付款保留提交时快照，仅补充冲回编号
+    p = body["payment"]
+    assert p["payment_id"] == "P1" and p["amount_cents"] == 100000
+    assert p["accrued_cents"] == 128160 and p["paid_before_cents"] == 0
+    assert p["reversal_id"] == "RV1"
+
+    # GET /payments/P1 的付款快照字段不变，reversal_id 建立关联
+    gp = client.get("/payments/P1").json()
+    assert gp["paid_before_cents"] == 0 and gp["reversal_id"] == "RV1"
+
+    # 结算总览：有效已付额归零，可付额恢复；毛额/冲回分列可查，冲回记录可查询
+    s = client.get("/authors/A1/settlement").json()
+    assert s["paid_cents"] == 0
+    assert s["paid_gross_cents"] == 100000 and s["reversed_cents"] == 100000
+    assert s["payable_cents"] == 128160 and s["negative_balance_cents"] == 0
+    assert s["payments"][0]["reversal_id"] == "RV1"
+    assert s["reversals"] == [
+        {
+            "reversal_id": "RV1",
+            "payment_id": "P1",
+            "reversal_amount_cents": 100000,
+            "latest_close_id": close_id,
+            "accrued_cents": 128160,
+            "created_at": s["reversals"][0]["created_at"],
+        }
+    ]
+
+    # 按冲回编号查询冻结结果
+    assert client.get("/payment-reversals/RV1").json() == body
+
+
+def test_payment_reversal_replay_same_content_and_conflicts(client):
+    _setup_paid_author(client, "P1", 100000)
+    body = reverse_payment(client, "RV1", "P1").json()
+
+    # 同冲回编号同内容重试 → 200 返回原冻结结果
+    r = reverse_payment(client, "RV1", "P1")
+    assert r.status_code == 200 and r.json() == body
+
+    # 同冲回编号异内容（指向另一付款）→ 409
+    r2 = reverse_payment(client, "RV1", "P2")
+    assert r2.status_code == 409
+
+    # 换编号对同一付款重复冲回 → 409（每笔付款至多冲回一次）
+    r3 = reverse_payment(client, "RV2", "P1")
+    assert r3.status_code == 409
+
+
+def test_payment_reversal_validation_and_404(client):
+    # 原付款不存在 → 404（幂等表中也无此冲回编号）
+    assert reverse_payment(client, "RV1", "NOPE").status_code == 404
+    assert client.get("/payment-reversals/NOPE").status_code == 404
+    # 空编号 → 422
+    assert client.post(
+        "/payment-reversals", json={"reversal_id": "", "payment_id": "P1"}
+    ).status_code == 422
+    assert client.post(
+        "/payment-reversals", json={"reversal_id": "RV1", "payment_id": ""}
+    ).status_code == 422
+    # 缺字段 → 422
+    assert client.post(
+        "/payment-reversals", json={"reversal_id": "RV1"}
+    ).status_code == 422
+
+
+def test_reversal_frees_payable_then_repay_and_partial_remaining(client):
+    _setup_paid_author(client, "P1", 100000)  # A1 应计 128160
+    assert reverse_payment(client, "RV1", "P1").status_code == 201
+
+    # 冲回后可按释放的可付额重新付款：先付 60000
+    close_id = client.get("/authors/A1/settlement").json()["latest_close_id"]
+    r = pay(client, "P2", "A1", close_id, 60000)
+    assert r.status_code == 201
+    assert r.json()["paid_before_cents"] == 0  # 有效已付额（毛额 100000 − 冲回 100000）
+    assert r.json()["payable_cents"] == 128160
+
+    # 再付 68160 结清；超付仍被拒（不能超付）
+    assert pay(client, "P3", "A1", close_id, 68160).status_code == 201
+    assert pay(client, "P4", "A1", close_id, 1).status_code == 400
+
+    s = client.get("/authors/A1/settlement").json()
+    assert s["paid_gross_cents"] == 228160  # 100000 + 60000 + 68160
+    assert s["reversed_cents"] == 100000
+    assert s["paid_cents"] == 128160 and s["payable_cents"] == 0
+    # 冲回的旧付款记录保留，未冲回的新付款 reversal_id 为 null
+    assert {p["payment_id"]: p["reversal_id"] for p in s["payments"]} == {
+        "P1": "RV1",
+        "P2": None,
+        "P3": None,
+    }
+
+
+def test_reversal_snapshot_frozen_after_later_close(client):
+    _setup_paid_author(client, "P1", 100000)  # A1 应计 128160
+    body = reverse_payment(client, "RV1", "P1").json()
+    assert body["author_settlement"]["latest_close_id"] == 1
+
+    # 冲回不占入账序号、不进入关账：空关账生成第 2 批后，旧冲回结果不变
+    c2 = client.post("/closes", json={"request_id": "C2"}).json()["close_id"]
+    assert c2 == 2
+    got = client.get("/payment-reversals/RV1").json()
+    assert got == body  # 快照冻结，后续关账不改变旧冲回结果
+    assert got["author_settlement"]["latest_close_id"] == 1
+    # 同冲回编号同内容重放仍返回登记时刻快照
+    assert reverse_payment(client, "RV1", "P1").json() == body
+
+    # 结算总览按最新关账快照重算（此处第 2 批净额为 0，应计仍 128160）
+    s = client.get("/authors/A1/settlement").json()
+    assert s["latest_close_id"] == 2 and s["accrued_cents"] == 128160
+    assert s["payable_cents"] == 128160 and s["reversed_cents"] == 100000
+
+
+def test_reversal_creates_negative_balance_offset_by_later_close(client):
+    make_work(client)
+    make_sale(client, "S1", copies=100)  # A1 应计 16020
+    c1 = client.post("/closes", json={"request_id": "C1"}).json()["close_id"]
+    assert pay(client, "P1", "A1", c1, 16020).status_code == 201
+    # 关账后全额退款并再关账：应计归零，形成 16020 待抵扣负余额
+    client.post("/refunds", json={"refund_id": "R1", "sale_id": "S1", "copies": 100})
+    c2 = client.post("/closes", json={"request_id": "C2"}).json()["close_id"]
+    assert client.get("/authors/A1/settlement").json()["negative_balance_cents"] == 16020
+
+    # 此时冲回原付款：有效已付额归零，负余额随之清零（可付额为 0）
+    r = reverse_payment(client, "RV1", "P1")
+    assert r.status_code == 201
+    snap = r.json()["author_settlement"]
+    assert snap["accrued_cents"] == 0 and snap["effective_paid_cents"] == 0
+    assert snap["negative_balance_cents"] == 0 and snap["payable_cents"] == 0
+
+    # 负余额已清零，冲回前被负余额挡住的付款场景恢复；后续正额关账后可正常付
+    make_sale(client, "S2", copies=100)  # A1 再应计 16020
+    c3 = client.post("/closes", json={"request_id": "C3"}).json()["close_id"]
+    s = client.get("/authors/A1/settlement").json()
+    assert s["accrued_cents"] == 16020 and s["paid_cents"] == 0
+    assert s["payable_cents"] == 16020 and s["negative_balance_cents"] == 0
+    assert pay(client, "P2", "A1", c3, 16020).status_code == 201
+
+
+def test_concurrent_reversal_and_payment_never_overpay(client):
+    # A1 应计 1000：付款 500 + 冲回与新付款并发，验证按提交顺序原子判定、不超付
+    make_work(
+        client,
+        tiers=[{"threshold": 0, "rate": 0.10}],
+        authors=[{"author_id": "A1", "ratio": 100}],
+    )
+    make_sale(client, "S1", copies=10, price="10.00")  # 10 册 × 100 分 = 1000
+    close_id = client.post("/closes").json()["close_id"]
+    assert pay(client, "P0", "A1", close_id, 500).status_code == 201
+
+    barrier = threading.Barrier(4)
+
+    def do_reverse():
+        barrier.wait()
+        return reverse_payment(client, "C-RV", "P0")
+
+    def do_new_pay(i):
+        barrier.wait()
+        return pay(client, f"CP{i}", "A1", close_id, 500)
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futs = [pool.submit(do_reverse)] + [pool.submit(do_new_pay, i) for i in range(3)]
+        results = [f.result() for f in futs]
+    # 冲回必成功；三笔各 500 的新付款中，有效已付额恰为 500 时只有一笔可成功
+    # （若冲回先提交则两笔成功、一笔 400；冲回后提交则零笔成功）：
+    # 统一不变量：付款总额 − 冲回总额 ≤ 应计 1000，且冲回恰好一次
+    assert any(r.status_code == 201 and r.json()["reversal_id"] == "C-RV"
+               for r in results[:1])
+    s = client.get("/authors/A1/settlement").json()
+    assert s["paid_cents"] == s["paid_gross_cents"] - s["reversed_cents"]
+    assert s["reversed_cents"] == 500
+    assert s["paid_cents"] <= 1000
+    assert s["paid_cents"] % 500 == 0
+    # 冲回的重放返回原结果，再换编号冲回仍 409
+    assert reverse_payment(client, "C-RV", "P0").status_code == 200
+    assert reverse_payment(client, "C-RV2", "P0").status_code == 409
+
+
+def test_reversal_keeps_close_reports_and_payment_snapshot_unchanged(client):
+    close_id = _setup_paid_author(client, "P1", 100000)
+    report_before = client.get(f"/closes/{close_id}").json()
+    pay_before = client.get("/payments/P1").json()
+    reverse_payment(client, "RV1", "P1")
+    # 既有关账报表完全保留
+    assert client.get(f"/closes/{close_id}").json() == report_before
+    # 原付款提交时快照金额字段保留（仅新增 reversal_id 关联字段）
+    pay_after = client.get("/payments/P1").json()
+    for k in ("amount_cents", "accrued_cents", "paid_before_cents", "payable_cents",
+              "paid_after_cents", "negative_balance_cents", "created_at"):
+        assert pay_after[k] == pay_before[k]
+    assert pay_after["reversal_id"] == "RV1"
+    # 冲回不占入账序号、不出现于关账明细
+    assert all(l["type"] != "payment_reversal" for l in report_before["lines"])
+
+
 # ---------------------------------------------------------------- 作者分成版本
 
 

@@ -15,6 +15,7 @@ from .ledger import ApiError
 from .schemas import (
     CloseIn,
     PaymentIn,
+    PaymentReversalIn,
     PriceCorrectionIn,
     ReconciliationIn,
     RefundIn,
@@ -32,8 +33,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="数字出版版税结算服务",
-    version="1.4.0",
-    description="阶梯版税计提、作者分成版本、退款冲销、净价更正、关账报表、关账后付款结算与渠道逐笔对账",
+    version="1.5.0",
+    description="阶梯版税计提、作者分成版本、退款冲销、净价更正、关账报表、关账后付款结算、银行退票整笔付款冲回与渠道逐笔对账",
     lifespan=lifespan,
 )
 
@@ -74,7 +75,7 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
 
 @app.get("/", summary="服务信息")
 def root():
-    return {"service": "数字出版版税结算服务", "version": "1.4.0", "docs": "/docs"}
+    return {"service": "数字出版版税结算服务", "version": "1.5.0", "docs": "/docs"}
 
 
 @app.get("/health", summary="健康检查")
@@ -222,7 +223,27 @@ def get_payment(payment_id: str):
     return ledger.get_payment(payment_id)
 
 
-@app.get("/authors/{author_id}/settlement", summary="作者结算总览（分批应计/已付/负余额/可付/付款记录）")
+@app.post(
+    "/payment-reversals",
+    status_code=201,
+    summary="登记银行退票整笔付款冲回（冲回编号全局唯一、幂等；整笔冲回，不支持部分冲回）",
+)
+def create_payment_reversal(payload: PaymentReversalIn, response: Response):
+    body, created = ledger.submit_payment_reversal(payload)
+    if not created:  # 同冲回编号同内容重试 → 返回原冻结结果
+        response.status_code = 200
+    return body
+
+
+@app.get(
+    "/payment-reversals/{reversal_id}",
+    summary="按冲回编号查询整笔付款冲回记录",
+)
+def get_payment_reversal_route(reversal_id: str):
+    return ledger.get_payment_reversal(reversal_id)
+
+
+@app.get("/authors/{author_id}/settlement", summary="作者结算总览（分批应计/已付/冲回/负余额/可付/付款与冲回记录）")
 def get_author_settlement(author_id: str):
     return ledger.author_settlement(author_id)
 

@@ -124,13 +124,28 @@ class PaymentIn(BaseModel):
     """作者付款结算请求：按当前最新关账批次结算可付额。
 
     - close_id 必须是当前最新关账批次，否则拒绝（409）；
-    - amount_cents 为支付金额（分），必须为正且不超过可付额。
+    - amount_cents 为支付金额（分），必须为正且不超过可付额；
+    - 有效已付额 = 付款总额 − 冲回总额，冲回后可付额按有效已付额重算。
     """
 
     author_id: str = Field(min_length=1, max_length=128)
     close_id: int = Field(gt=0)
     payment_id: str = Field(min_length=1, max_length=128)
     amount_cents: int = Field(gt=0)
+
+
+class PaymentReversalIn(BaseModel):
+    """银行退票整笔付款冲回请求。
+
+    - 财务凭全局唯一冲回编号 reversal_id 与原付款编号 payment_id 登记整笔冲回；
+    - 只支持整笔冲回（冲回金额恒等于原付款金额），不支持部分冲回；
+    - 每笔付款至多冲回一次：同冲回编号同内容重试返回原结果（200），
+      同冲回编号异内容或换编号对同一付款重复冲回均拒绝（409）；
+    - 原付款不存在返回 404；冲回编号或付款编号为空返回 422。
+    """
+
+    reversal_id: str = Field(min_length=1, max_length=128, description="全局唯一冲回编号")
+    payment_id: str = Field(min_length=1, max_length=128, description="原付款编号")
 
 
 class ReconciliationReceiptIn(BaseModel):

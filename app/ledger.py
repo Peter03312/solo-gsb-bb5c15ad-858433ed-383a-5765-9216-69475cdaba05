@@ -24,12 +24,23 @@
 付款结算（关账后）：
 - 以作者编号、当前最新关账批次编号、付款编号、支付金额（分）提交；
 - 应计额 = 截至该批次全部不可改关账快照中该作者净额之和；
-- 已付额 = 该作者全部已确认付款之和；可付额 = max(应计额 - 已付额, 0)；
+- 已付额（有效已付额）= 该作者全部已确认付款之和 − 已冲回总额；可付额 = max(应计额 − 已付额, 0)；
 - 关账后退款若使应计额低于已付额，差额为待抵扣负余额，后续关账的正额先抵扣，
   旧报表与旧付款均不改写；
 - 支付金额必须为正且不超过可付额；作者/批次不存在、批次非当前最新一律拒绝；
 - 同付款编号同内容重试返回原结算结果（即使之后又有关账），异内容拒绝（409）；
 - 全部结算写操作在同一全局锁与单事务内完成，并发结算不会超付。
+
+银行退票冲回（整笔付款冲回）：
+- 财务凭全局唯一冲回编号与原付款编号登记整笔付款冲回，不支持部分冲回
+  （冲回金额恒等于原付款金额）；返回关联付款、冲回金额及登记时刻的作者结算快照；
+- 原付款及其提交时快照、既有关账报表均保留不改写；冲回不占入账序号、不进入关账批次，
+  冲回记录在作者结算总览中可查询；
+- 每笔付款至多冲回一次：同冲回编号同内容重试返回原结果（200），同冲回编号异内容或
+  换编号对同一付款重复冲回均拒绝（409）；原付款不存在返回 404；
+- 有效已付额 = 付款总额 − 冲回总额；可付额与待抵扣负余额按最新关账快照重算；
+  后续关账不改变旧冲回结果（冲回响应为登记时刻快照）；
+- 冲回与新付款并发时按提交顺序（数据库提交顺序）原子判定，有效已付额不超付。
 
 净价更正（销售净价录错）：
 - 财务凭全局唯一更正编号、原销售编号与非负新每册净价提交更正；
@@ -57,7 +68,15 @@ from datetime import datetime, timezone
 from decimal import Decimal, ROUND_FLOOR, ROUND_HALF_UP
 
 from .db import LOCK, get_conn
-from .schemas import PaymentIn, PriceCorrectionIn, RefundIn, SaleIn, SplitChangeIn, WorkIn
+from .schemas import (
+    PaymentIn,
+    PaymentReversalIn,
+    PriceCorrectionIn,
+    RefundIn,
+    SaleIn,
+    SplitChangeIn,
+    WorkIn,
+)
 
 CENT = Decimal("0.01")
 HUNDRED = Decimal(100)
@@ -1281,12 +1300,28 @@ def _accrued_cents(conn: sqlite3.Connection, author_id: str, through_close_id: i
     return r["c"]
 
 
-def _paid_cents(conn: sqlite3.Connection, author_id: str) -> int:
+def _gross_paid_cents(conn: sqlite3.Connection, author_id: str) -> int:
+    """该作者全部已确认付款之和（不扣冲回）。"""
     r = conn.execute(
         "SELECT COALESCE(SUM(amount_cents),0) AS c FROM payments WHERE author_id=?",
         (author_id,),
     ).fetchone()
     return r["c"]
+
+
+def _reversed_cents(conn: sqlite3.Connection, author_id: str) -> int:
+    """该作者全部银行退票冲回金额之和。"""
+    r = conn.execute(
+        "SELECT COALESCE(SUM(amount_cents),0) AS c FROM payment_reversals"
+        " WHERE author_id=?",
+        (author_id,),
+    ).fetchone()
+    return r["c"]
+
+
+def _effective_paid_cents(conn: sqlite3.Connection, author_id: str) -> int:
+    """有效已付额 = 付款总额 − 冲回总额。"""
+    return _gross_paid_cents(conn, author_id) - _reversed_cents(conn, author_id)
 
 
 def _payment_fingerprint(p: PaymentIn) -> str:
@@ -1300,7 +1335,16 @@ def _payment_fingerprint(p: PaymentIn) -> str:
     )
 
 
-def _payment_response_from_row(row: sqlite3.Row) -> dict:
+def _payment_reversal_id(conn: sqlite3.Connection, payment_id: str) -> str | None:
+    r = conn.execute(
+        "SELECT reversal_id FROM payment_reversals WHERE payment_id=?", (payment_id,)
+    ).fetchone()
+    return r["reversal_id"] if r is not None else None
+
+
+def _payment_response_from_row(
+    conn: sqlite3.Connection, row: sqlite3.Row
+) -> dict:
     accrued = row["accrued_cents"]
     paid_after = row["paid_before_cents"] + row["amount_cents"]
     return {
@@ -1313,6 +1357,9 @@ def _payment_response_from_row(row: sqlite3.Row) -> dict:
         "payable_cents": row["payable_cents"],
         "paid_after_cents": paid_after,
         "negative_balance_cents": max(paid_after - accrued, 0),
+        # 该付款是否已被银行退票整笔冲回（冲回编号；未冲回为 None）。
+        # 付款提交时快照字段（accrued/paid_before/payable 等）始终保留提交时刻结果。
+        "reversal_id": _payment_reversal_id(conn, row["payment_id"]),
         "created_at": row["created_at"],
     }
 
@@ -1329,7 +1376,7 @@ def submit_payment(p: PaymentIn) -> tuple[dict, bool]:
         if row is not None:
             if row["fingerprint"] != fp:
                 raise _conflict(f"付款编号 {p.payment_id} 已存在且内容不一致")
-            return _payment_response_from_row(row), False
+            return _payment_response_from_row(conn, row), False
         if not _author_exists(conn, p.author_id):
             raise _not_found(f"作者 {p.author_id} 不存在")
         if conn.execute(
@@ -1344,7 +1391,8 @@ def submit_payment(p: PaymentIn) -> tuple[dict, bool]:
                     f"关账批次 {p.close_id} 不是当前最新批次（最新为 {latest}），拒绝结算"
                 )
             accrued = _accrued_cents(conn, p.author_id, p.close_id)
-            paid_before = _paid_cents(conn, p.author_id)
+            # 有效已付额 = 付款总额 − 冲回总额；冲回释放的可付额可再次支付
+            paid_before = _effective_paid_cents(conn, p.author_id)
             payable = max(accrued - paid_before, 0)
             if p.amount_cents > payable:
                 raise _bad_request(
@@ -1374,21 +1422,179 @@ def submit_payment(p: PaymentIn) -> tuple[dict, bool]:
         except Exception:
             conn.rollback()
             raise
-        return _payment_response_from_row(row), True
+        return _payment_response_from_row(conn, row), True
 
 
 def get_payment(payment_id: str) -> dict:
     with LOCK:
-        row = get_conn().execute(
+        conn = get_conn()
+        row = conn.execute(
             "SELECT * FROM payments WHERE payment_id=?", (payment_id,)
         ).fetchone()
         if row is None:
             raise _not_found(f"付款 {payment_id} 不存在")
-        return _payment_response_from_row(row)
+        return _payment_response_from_row(conn, row)
+
+
+# ------------------------------------------------- 银行退票整笔付款冲回
+
+
+def _reversal_fingerprint(p: PaymentReversalIn) -> str:
+    return _fingerprint(
+        {"reversal_id": p.reversal_id, "payment_id": p.payment_id}
+    )
+
+
+def _author_settlement_snapshot(conn: sqlite3.Connection, author_id: str) -> dict:
+    """登记时刻的作者结算快照：可付额与待抵扣负余额按最新关账快照重算。
+
+    paid_before_cents 为付款总额（毛额），reversed_before_cents 为已冲回总额，
+    有效已付额 = 两者之差；payable/negative_balance 以有效已付额计算。
+    """
+    latest = _latest_close_id(conn)
+    accrued = _accrued_cents(conn, author_id, latest) if latest is not None else 0
+    gross_paid = _gross_paid_cents(conn, author_id)
+    reversed_total = _reversed_cents(conn, author_id)
+    effective_paid = gross_paid - reversed_total
+    return {
+        "latest_close_id": latest,
+        "accrued_cents": accrued,
+        "paid_before_cents": gross_paid,
+        "reversed_before_cents": reversed_total,
+        "effective_paid_cents": effective_paid,
+        "payable_cents": max(accrued - effective_paid, 0),
+        "negative_balance_cents": max(effective_paid - accrued, 0),
+    }
+
+
+def _reversal_response(conn: sqlite3.Connection, row: sqlite3.Row) -> dict:
+    """冲回结果：优先返回登记时冻结的完整快照（后续关账/新付款不改变旧冲回结果）。"""
+    return json.loads(row["snapshot"])
+
+
+def _build_reversal_response(
+    conn: sqlite3.Connection,
+    reversal_id: str,
+    payment_row: sqlite3.Row,
+    created_at: str,
+    snap_before: dict,
+) -> dict:
+    """构造冲回响应（含登记时刻作者结算快照）。
+
+    snap_before 为不含本次冲回的快照；冲回后有效已付额减少整笔付款金额。
+    """
+    amount = payment_row["amount_cents"]
+    author_id = payment_row["author_id"]
+    effective_after = snap_before["effective_paid_cents"] - amount
+    accrued = snap_before["accrued_cents"]
+    return {
+        "type": "payment_reversal",
+        "reversal_id": reversal_id,
+        "payment_id": payment_row["payment_id"],
+        "author_id": author_id,
+        # 冲回金额恒等于原付款金额（整笔冲回，不支持部分冲回）
+        "reversal_amount_cents": amount,
+        # 登记时刻作者结算快照（冲回后口径）；历史不可改，重放与后续关账均原样返回
+        "author_settlement": {
+            "latest_close_id": snap_before["latest_close_id"],
+            "accrued_cents": accrued,
+            "paid_before_cents": snap_before["paid_before_cents"],
+            "reversed_before_cents": snap_before["reversed_before_cents"] + amount,
+            "effective_paid_cents": effective_after,
+            "payable_cents": max(accrued - effective_after, 0),
+            "negative_balance_cents": max(effective_after - accrued, 0),
+        },
+        # 关联付款（保留付款提交时快照，仅补充冲回编号关联）
+        "payment": {
+            **_payment_response_from_row(conn, payment_row),
+            "reversal_id": reversal_id,
+        },
+        "created_at": created_at,
+    }
+
+
+def submit_payment_reversal(p: PaymentReversalIn) -> tuple[dict, bool]:
+    """登记银行退票整笔付款冲回。返回 (冲回结果, 是否新建)。"""
+    fp = _reversal_fingerprint(p)
+    with LOCK:
+        conn = get_conn()
+        # 冲回编号全局唯一：同号同内容 → 返回原冻结结果；同号异内容 → 409
+        row = conn.execute(
+            "SELECT * FROM payment_reversals WHERE reversal_id=?", (p.reversal_id,)
+        ).fetchone()
+        if row is not None:
+            if row["fingerprint"] != fp:
+                raise _conflict(f"冲回编号 {p.reversal_id} 已存在且内容不一致")
+            return _reversal_response(conn, row), False
+        payment_row = conn.execute(
+            "SELECT * FROM payments WHERE payment_id=?", (p.payment_id,)
+        ).fetchone()
+        if payment_row is None:
+            raise _not_found(f"原付款 {p.payment_id} 不存在")
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            # 每笔付款至多冲回一次；换编号对同一付款重复冲回 → 409
+            dup = conn.execute(
+                "SELECT reversal_id FROM payment_reversals WHERE payment_id=?",
+                (p.payment_id,),
+            ).fetchone()
+            if dup is not None:
+                raise _conflict(
+                    f"付款 {p.payment_id} 已被冲回（冲回编号 {dup['reversal_id']}），"
+                    "每笔付款至多冲回一次"
+                )
+            now = _utcnow()
+            # 登记时刻作者结算快照（不含本次冲回），可付额按最新关账快照重算
+            snap_before = _author_settlement_snapshot(conn, payment_row["author_id"])
+            cur = conn.execute(
+                "INSERT INTO payment_reversals(reversal_id, payment_id, author_id,"
+                " amount_cents, latest_close_id, accrued_cents, paid_before_cents,"
+                " reversed_before_cents, payable_cents, negative_balance_cents,"
+                " fingerprint, snapshot, created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    p.reversal_id,
+                    p.payment_id,
+                    payment_row["author_id"],
+                    payment_row["amount_cents"],
+                    snap_before["latest_close_id"],
+                    snap_before["accrued_cents"],
+                    snap_before["paid_before_cents"],
+                    snap_before["reversed_before_cents"],
+                    snap_before["payable_cents"],
+                    snap_before["negative_balance_cents"],
+                    fp,
+                    "",  # 占位，提交前回填冻结快照
+                    now,
+                ),
+            )
+            # 重新读取付款行（同事务内），构造完整冻结结果并落库
+            body = _build_reversal_response(conn, p.reversal_id, payment_row, now, snap_before)
+            conn.execute(
+                "UPDATE payment_reversals SET snapshot=? WHERE reversal_id=?",
+                (json.dumps(body, ensure_ascii=False), p.reversal_id),
+            )
+            saved = conn.execute(
+                "SELECT * FROM payment_reversals WHERE rowid=?", (cur.lastrowid,)
+            ).fetchone()
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return _reversal_response(conn, saved), True
+
+
+def get_payment_reversal(reversal_id: str) -> dict:
+    with LOCK:
+        row = get_conn().execute(
+            "SELECT * FROM payment_reversals WHERE reversal_id=?", (reversal_id,)
+        ).fetchone()
+        if row is None:
+            raise _not_found(f"付款冲回 {reversal_id} 不存在")
+        return _reversal_response(get_conn(), row)
 
 
 def author_settlement(author_id: str) -> dict:
-    """按作者查询：分批应计、累计应计、已付额、负余额、可付额及全部付款记录。"""
+    """按作者查询：分批应计、累计应计、付款总额/冲回/有效已付、负余额、可付额及记录。"""
     with LOCK:
         conn = get_conn()
         if not _author_exists(conn, author_id):
@@ -1412,7 +1618,9 @@ def author_settlement(author_id: str) -> dict:
                     "accrued_cents": cumulative,
                 }
             )
-        paid = _paid_cents(conn, author_id)
+        gross_paid = _gross_paid_cents(conn, author_id)
+        reversed_total = _reversed_cents(conn, author_id)
+        paid = gross_paid - reversed_total  # 有效已付额 = 付款总额 − 冲回总额
         latest = _latest_close_id(conn)
         accrued = cumulative  # 截至最新批次的应计额；无批次时为 0
         return {
@@ -1420,6 +1628,8 @@ def author_settlement(author_id: str) -> dict:
             "latest_close_id": latest,
             "accrued_cents": accrued,
             "paid_cents": paid,
+            "paid_gross_cents": gross_paid,
+            "reversed_cents": reversed_total,
             "negative_balance_cents": max(paid - accrued, 0),
             "payable_cents": max(accrued - paid, 0),
             "batches": per_batch,
@@ -1431,11 +1641,27 @@ def author_settlement(author_id: str) -> dict:
                     "accrued_cents": r["accrued_cents"],
                     "paid_before_cents": r["paid_before_cents"],
                     "payable_cents": r["payable_cents"],
+                    "reversal_id": _payment_reversal_id(conn, r["payment_id"]),
                     "created_at": r["created_at"],
                 }
                 for r in conn.execute(
                     "SELECT * FROM payments WHERE author_id=?"
                     " ORDER BY created_at, payment_id",
+                    (author_id,),
+                )
+            ],
+            "reversals": [
+                {
+                    "reversal_id": r["reversal_id"],
+                    "payment_id": r["payment_id"],
+                    "reversal_amount_cents": r["amount_cents"],
+                    "latest_close_id": r["latest_close_id"],
+                    "accrued_cents": r["accrued_cents"],
+                    "created_at": r["created_at"],
+                }
+                for r in conn.execute(
+                    "SELECT * FROM payment_reversals WHERE author_id=?"
+                    " ORDER BY created_at, reversal_id",
                     (author_id,),
                 )
             ],

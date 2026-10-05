@@ -157,6 +157,29 @@ CREATE TABLE IF NOT EXISTS payments (
 );
 CREATE INDEX IF NOT EXISTS idx_payments_author ON payments(author_id);
 
+-- 银行退票导致的整笔付款冲回：每笔付款至多冲回一次（payment_id 全局唯一），
+-- reversal_id 全局唯一且幂等；冲回不产生入账序号、不进入关账批次、不改写任何历史数据。
+-- amount_cents 恒等于被冲回付款的金额（不支持部分冲回）；
+-- accrued/latest_close_id/paid_before_cents/reversed_before_cents/payable_cents/
+-- negative_balance_cents 为登记时刻的作者结算快照，幂等重放原样返回，不随后续关账变化；
+-- snapshot 为完整冲回结果的冻结 JSON 快照，后续关账或新付款均不改变旧冲回结果。
+CREATE TABLE IF NOT EXISTS payment_reversals (
+    reversal_id            TEXT PRIMARY KEY,
+    payment_id             TEXT NOT NULL UNIQUE REFERENCES payments(payment_id),
+    author_id              TEXT NOT NULL,
+    amount_cents           INTEGER NOT NULL CHECK (amount_cents > 0),
+    latest_close_id        INTEGER,
+    accrued_cents          INTEGER NOT NULL,
+    paid_before_cents      INTEGER NOT NULL,
+    reversed_before_cents  INTEGER NOT NULL,
+    payable_cents          INTEGER NOT NULL,
+    negative_balance_cents INTEGER NOT NULL,
+    fingerprint            TEXT NOT NULL,
+    snapshot               TEXT NOT NULL,
+    created_at             TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_payment_reversals_author ON payment_reversals(author_id);
+
 -- 净价更正：以独立流水补提/冲回各档未退册数的新旧净价版税差额，
 -- 不改写历史销售；old_net_price 为该销售的"当前更正价"（首次即原价）
 CREATE TABLE IF NOT EXISTS price_corrections (
