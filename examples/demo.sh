@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # 端到端调用示例：录入作品 → 销售 → 退款 → 关账 → 查看报表 → 付款结算
 #              → 作者分成版本变更 → 新版本销售/旧销售退款 → 退出作者结算
+#              → 净价更正 → 渠道对账 → 付款冲回（银行退票）
 # 用法：BASE_URL=http://localhost:8000 ./examples/demo.sh
 set -euo pipefail
 
@@ -197,3 +198,26 @@ curl -s "$BASE/reconciliations" | fmt
 curl -s "$BASE/reconciliations?channel=CH-X" | fmt
 curl -s "$BASE/reconciliations/1" | fmt
 curl -s "$BASE/reconciliations/by-batch/RECON-CHX-2026-11" | fmt
+
+echo "== 25. 银行退票：凭全局唯一冲回编号 + 原付款编号整笔冲回 PAY-2026-09-A1 =="
+echo "    返回关联付款快照、冲回金额（= 原付款整笔金额）与登记时作者结算快照"
+curl -s -X POST "$BASE/payment-reversals" -H 'Content-Type: application/json' -d '{
+  "reversal_id": "REV-2026-10-PAY-2026-09-A1",
+  "payment_id": "PAY-2026-09-A1"
+}' | fmt
+
+echo "== 26. 同冲回编号同内容重试 → 200 原结果；换编号重复冲回同一付款 → 409 =="
+curl -s -o /dev/null -w 'replay status: %{http_code}\n' -X POST "$BASE/payment-reversals" \
+  -H 'Content-Type: application/json' -d '{
+    "reversal_id": "REV-2026-10-PAY-2026-09-A1", "payment_id": "PAY-2026-09-A1"
+  }'
+curl -s -o /dev/null -w 'duplicate status: %{http_code} (409)\n' -X POST "$BASE/payment-reversals" \
+  -H 'Content-Type: application/json' -d '{
+    "reversal_id": "REV-2026-10-OTHER", "payment_id": "PAY-2026-09-A1"
+  }'
+
+echo "== 27. 结算总览：有效已付 = 付款总额 − 冲回总额，可付恢复，冲回记录可查 =="
+curl -s "$BASE/authors/A1/settlement" | fmt
+
+echo "== 28. 按冲回编号查询冲回详情（含关联付款快照与登记时结算快照）=="
+curl -s "$BASE/payment-reversals/REV-2026-10-PAY-2026-09-A1" | fmt

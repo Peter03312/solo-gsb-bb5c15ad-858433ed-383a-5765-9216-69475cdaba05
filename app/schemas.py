@@ -133,6 +133,19 @@ class PaymentIn(BaseModel):
     amount_cents: int = Field(gt=0)
 
 
+class PaymentReversalIn(BaseModel):
+    """付款冲回（银行退票）：凭全局唯一冲回编号 + 原付款编号登记整笔冲回。
+
+    - 不支持部分冲回：冲回金额恒为原付款整笔金额；
+    - 每笔付款至多冲回一次：换编号重复冲回同一付款拒绝（409）；
+    - 同冲回编号同内容重试返回原结果，异内容拒绝（409，冲回编号全局唯一）；
+    - 原付款不存在 404。
+    """
+
+    reversal_id: str = Field(min_length=1, max_length=128)
+    payment_id: str = Field(min_length=1, max_length=128)
+
+
 class ReconciliationReceiptIn(BaseModel):
     """渠道逐笔回单。
 
